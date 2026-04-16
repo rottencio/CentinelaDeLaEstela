@@ -1,6 +1,7 @@
 dist/ 
 build/ 
 __pycache__/
-CentinelaDeLaEstela0.0.py 
-CentinelaDeLaEstela0.1.py 
-CentinelaDeLaEstela0.2.py 
+*.spec
+TODO.md
+CentinelaDeLaEstela0*.py 
+CentinelaDeLaEstela1*.py 
