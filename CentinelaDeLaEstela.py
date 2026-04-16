@@ -16,6 +16,7 @@ from watchdog.events import FileSystemEventHandler
 # ---------- CONSTANTES ----------
 # Win32 API constants para modificar la estela del cursor y notificar cambios
 SPI_SETMOUSETRAILS = 0x005D  # Enable / set estela del cursor
+SPI_GETMOUSETRAILS = 0x005E  # Obtener valor actual de estela del cursor
 SPIF_UPDATEINIFILE = 0x01  # Guarda la configuración en el registro para que persista
 SPIF_SENDCHANGE = 0x02  # Notifica a las apps y al sistema que el parámetro ha cambiado
 # Intervalos de tiempo
@@ -28,7 +29,7 @@ STATS_END = "--- END STATS ---"
 # ---------- VARIABLES ----------
 # logger global para registrar eventos y estadísticas
 logger = logging.getLogger("EstelaCursor")
-logger.setLevel(logging.INFO) # Nivel INFO: registra información y alertas
+logger.setLevel(logging.INFO)  # Nivel INFO: registra información y alertas
 file_handler = None  # Handler del archivo de log
 # Variables para control de estado y estadísticas
 current_month = None  # Mes actual del log
@@ -83,7 +84,7 @@ def get_last_logged_month():
             for f in os.listdir(LOG_DIR)
             if f.startswith("estela_cursor_") and f.endswith(".log")
         ]
-        
+
         # Si no hay logs, retornamos None para iniciar con el mes actual
         if not logs:
             return None
@@ -142,7 +143,7 @@ def write_stats_to_log(log_path):
                 lines = f.readlines()
 
         # Eliminar bloque STATS previo si existe
-        cleaned = [] 
+        cleaned = []
         skip = False
         for line in lines:
             if line.strip() == STATS_START:
@@ -229,6 +230,17 @@ def setup_logger():
     # Actualizamos mes actual
     current_month = month_str
 
+# ---------- OBTENER ESTELA DEL SISTEMA ----------
+def get_mouse_trails_system():
+    """
+    Obtiene el valor REAL de la estela desde el sistema (no solo registro)
+    """
+    value = ctypes.c_int()
+    ctypes.windll.user32.SystemParametersInfoW(
+        SPI_GETMOUSETRAILS, 0, ctypes.byref(value), 0
+    )
+    return str(value.value)
+
 # ----------** FUNCION PRINCIPAL **----------
 def activar_estela():
     """
@@ -253,55 +265,68 @@ def activar_estela():
         )
 
         # Leer valor actual de MouseTrails
-        value, _ = winreg.QueryValueEx(key, "MouseTrails")
+        registry_value, _ = winreg.QueryValueEx(key, "MouseTrails")  # Obtenemos el valor del registro
+        system_value = get_mouse_trails_system()  # Obtenemos el valor real del sistema
 
         # ---------- DETECCION Y CLASIFICACION ----------
-        if value != DESIRED_VALUE:
+        if system_value != DESIRED_VALUE:
+
+            # Diferenciar si el cambio viene del registro o solo del sistema (runtime)
+            if registry_value == DESIRED_VALUE:
+                logger.warning("👻 Cambio SOLO en memoria detectado (no persistente)")
 
             # Caso 1: estela desactivada completamente
-            if value == "0":
+            if system_value == "0":
                 logger.warning("🚨 ALERTA: Estela del ratón DESACTIVADA externamente")
                 deactivated_count += 1  # Contador de desactivaciones
                 write_stats_to_log(current_log_path())
 
             # Caso 2: estela activa pero con longitud distinta
-            elif value.isdigit() and 1 <= int(value) <= 6:
+            elif system_value.isdigit() and 1 <= int(system_value) <= 6:
                 logger.warning(
                     f"⚠️ Aviso: Longitud de estela modificada "
-                    f"({value} → {DESIRED_VALUE})"
+                    f"(system={system_value}, reg={registry_value} → {DESIRED_VALUE})"
                 )
                 modified_count += 1  # Contador de modificaciones
                 write_stats_to_log(current_log_path())
 
             # Caso 3: valor inesperado / corrupto
             else:
-                logger.warning(f"⚠️❓ Valor inesperado de MouseTrails detectado: {value}")
+                logger.warning(
+                    f"⚠️❓ Valor inesperado de MouseTrails detectado: {system_value}"
+                )
                 error_count += 1  # Contador de errores
                 write_stats_to_log(current_log_path())
 
             # ---------- CORRECCION DE LA ESTELA ----------
             # 1️⃣ Modifica el registro de Windows directamente
-            winreg.SetValueEx(
-                key,  # La clave de registro abierta
-                "MouseTrails",  # El nombre del valor que queremos cambiar
-                0,  # Reservado, siempre 0
-                winreg.REG_SZ,  # Tipo de valor: cadena de texto
-                DESIRED_VALUE,  # Valor que queremos poner (por ejemplo "7")
-            )
+            if registry_value != DESIRED_VALUE:
+                winreg.SetValueEx(
+                    key,  # La clave de registro abierta
+                    "MouseTrails",  # El nombre del valor que queremos cambiar
+                    0,  # Reservado, siempre 0
+                    winreg.REG_SZ,  # Tipo de valor: cadena de texto
+                    DESIRED_VALUE,  # Valor que queremos poner (por ejemplo "7")
+                )
 
             # 2️⃣ Aplicar los cambios inmediatamente en el sistema
             # SystemParametersInfoW permite notificar a Windows que se ha cambiado un parámetro de usuario
-            ctypes.windll.user32.SystemParametersInfoW(
+            result = ctypes.windll.user32.SystemParametersInfoW(
                 SPI_SETMOUSETRAILS,
                 int(DESIRED_VALUE),
                 None,
                 SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
             )
+            if not result:
+                logger.error("❌Error aplicando cambios")
+
             # 3️⃣ Registrar en el log que hemos corregido la estela
             logger.info(f"🔁Estela restaurada automáticamente a {DESIRED_VALUE}")
 
         else:
-            logger.info(f"👀Estela en estado correcto ({value})")
+            logger.info(
+                f"👀Estela en estado correcto (system={system_value}, reg={registry_value})"
+            )
 
         # Cerramos la clave de registro para liberar recursos
         winreg.CloseKey(key)
@@ -313,7 +338,7 @@ def activar_estela():
 # ---------- SHUTDOWN COORDINADO ----------
 def request_shutdown(reason: str):
     """
-    Cierre coordinado del script: escribe logs finales, 
+    Cierre coordinado del script: escribe logs finales,
     forzar flush y cambia running a False
     """
     global running
@@ -338,7 +363,7 @@ def request_shutdown(reason: str):
 
 # ---------- WM_QUERYENDSESSION ----------
 def shutdown_wnd_proc(hwnd, msg, wparam, lparam):
-    """ Procesa mensajes WM_QUERYENDSESSION de Windows para apagar/logoff"""
+    """Procesa mensajes WM_QUERYENDSESSION de Windows para apagar/logoff"""
     # Solicitamos un cierre coordinado
     if msg == win32con.WM_QUERYENDSESSION:
         request_shutdown("🖥️ (apagado/logoff)")
@@ -347,7 +372,7 @@ def shutdown_wnd_proc(hwnd, msg, wparam, lparam):
 
 def start_shutdown_listener():
     """Crea una ventana oculta para escuchar mensajes de apagado/logoff de Windows"""
-    try:        
+    try:
         # Configuramos una clase de ventana para recibir mensajes del sistema
         wc = win32gui.WNDCLASS()
         wc.lpfnWndProc = shutdown_wnd_proc
@@ -357,11 +382,7 @@ def start_shutdown_listener():
 
         # Creamos una ventana oculta para recibir mensajes del sistema
         win32gui.CreateWindow(
-            wc.lpszClassName, 
-            wc.lpszClassName, 
-            0, 0, 0, 0, 0, 0, 0, 
-            wc.hInstance, 
-            None
+            wc.lpszClassName, wc.lpszClassName, 0, 0, 0, 0, 0, 0, 0, wc.hInstance, None
         )
 
         # Iniciamos el loop de mensajes para que la ventana pueda recibir eventos
@@ -437,6 +458,7 @@ class ControlFileHandler(FileSystemEventHandler):
     Manejador de eventos de Watchdog para detectar cambios en el archivo de control.
     Cada vez que el archivo es modificado, se lee y aplica el estado correspondiente.
     """
+
     def on_modified(self, event):
         # Solo actuamos si se modificó el archivo de control que nos interesa
         if os.path.abspath(event.src_path) == os.path.abspath(CONTROL_FILE):
@@ -520,9 +542,12 @@ def console_ctrl_handler(ctrl_type):
 # Registramos el handler para eventos de control de consola (incluye apagado/reinicio)
 ctypes.windll.kernel32.SetConsoleCtrlHandler(
     ctypes.WINFUNCTYPE(
-        ctypes.c_bool,                          # Tipo de evento (Ctrl+C, cierre de consola, apagado, etc.)
-        ctypes.c_uint)(console_ctrl_handler),   # Función que maneja el evento
-        True                                    # Activar el handler
+        ctypes.c_bool,  # Tipo de evento (Ctrl+C, cierre de consola, apagado, etc.)
+        ctypes.c_uint,
+    )(
+        console_ctrl_handler
+    ),  # Función que maneja el evento
+    True,  # Activar el handler
 )
 
 # ---------- LOOP ----------
